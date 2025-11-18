@@ -25,6 +25,8 @@ import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
+from omegaconf import ListConfig
+
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_local_path_from_hdfs
 
@@ -59,8 +61,9 @@ class MultiTurnSFTDataset(Dataset):
         self.enable_thinking_key = multiturn_config.get("enable_thinking_key", "enable_thinking")
         assert self.truncation in ["error", "left", "right"]
 
-        if not isinstance(parquet_files, List):
-            parquet_files = [parquet_files]
+        # Convert ListConfig to regular list and handle single file case
+        if not isinstance(parquet_files, list):
+            parquet_files = [parquet_files] if isinstance(parquet_files, str) else list(parquet_files)
 
         self.parquet_files = parquet_files
         if isinstance(tokenizer, str):

@@ -22,11 +22,14 @@ import os
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+USE_FLASH_ATTENTION = os.environ.get("USE_FLASH_ATTENTION", "1") == "1"
+FLASH_ATTN_AVAILABLE = False
+
+import warnings
+warnings.filterwarnings("ignore", message=".*NO_SHARD.*full_state_dict.*")
 
 import logging
 import re
-from contextlib import nullcontext
-
 import hydra
 import torch
 import torch.distributed
@@ -50,20 +53,9 @@ from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import CPUOffloadPolicy, MixedPrecisionPolicy, apply_fsdp2, fsdp2_clip_grad_norm_, fsdp2_load_full_state_dict, get_fsdp_wrap_policy, get_init_weight_context_manager, init_fn
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_dtypes import PrecisionType
+from omegaconf import OmegaConf
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
 from verl.utils.tracking import Tracking
-from verl.utils.ulysses import (
-    gather_outpus_and_unpad,
-    get_ulysses_sequence_parallel_world_size,
-    ulysses_pad_and_slice_inputs,
-)
-from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
-
-if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-elif is_npu_available:
-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
-
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
@@ -80,7 +72,6 @@ class FSDPSFTTrainer:
         self.config = config
         self.device_mesh = device_mesh
         self.ulysses_device_mesh = ulysses_device_mesh
-        self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.tokenizer = tokenizer
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
@@ -89,9 +80,14 @@ class FSDPSFTTrainer:
         self._normalize_config_bsz()
 
         # Set sequence parallel size
-        self.config.ulysses_sequence_parallel_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
-        self.use_remove_padding = getattr(self.config, "use_remove_padding", False)
+        original_sp_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
+        original_remove_padding = getattr(self.config, "use_remove_padding", False)
+        self.config.ulysses_sequence_parallel_size = 1
+        self.use_remove_padding = False
+        setattr(self.config, "use_remove_padding", False)
         if self.device_mesh.get_rank() == 0:
+            if original_sp_size > 1 or original_remove_padding:
+                print("Flash attention support has been removed; forcing sequence parallel size to 1 and disable remove padding.")
             print(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
             print(f"Using remove padding: {self.use_remove_padding}")
 
@@ -178,9 +174,6 @@ class FSDPSFTTrainer:
         self.model_config = config
         if hasattr(self.model_config, "max_position_embeddings"):
             self.model_config.max_position_embeddings = max(self.model_config.max_position_embeddings, self.config.data.max_length)
-        if self.config.ulysses_sequence_parallel_size > 1:
-            assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
-
         # This may be very large
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings, mesh=self.device_mesh)
 
@@ -189,14 +182,9 @@ class FSDPSFTTrainer:
                 local_model_path,
                 config=config,
                 torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=None,
                 trust_remote_code=trust_remote_code,
             )
-
-            if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
-                from verl.models.transformers.monkey_patch import apply_monkey_patch
-
-                apply_monkey_patch(model=self.model, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
 
             # Apply Liger kernel if use_liger is enabled
             if self.config.model.get("use_liger", False):
@@ -245,7 +233,7 @@ class FSDPSFTTrainer:
                 use_orig_params=False,
                 auto_wrap_policy=auto_wrap_policy,
                 device_id=get_device_id(),
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                sharding_strategy=ShardingStrategy.NO_SHARD,
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 device_mesh=self.device_mesh,
@@ -296,8 +284,6 @@ class FSDPSFTTrainer:
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
-        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
-
         # Move inputs to GPU and prepare loss mask
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
@@ -305,73 +291,26 @@ class FSDPSFTTrainer:
         loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).to(self.device_name)
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
-        # Context manager for sequence parallel if needed
-        context = self.sharding_manager if use_sp else nullcontext()
-        with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            if not use_sp:
-                # Standard forward pass without sequence parallel
-                labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
-                logits = output.logits
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            labels = input_ids[:, 1:].contiguous()
+            output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
+            logits = output.logits
 
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels.contiguous()
-                # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-                loss = loss * loss_mask.to(loss.device)
-            else:
-                # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
-                # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
-                # 1. All SP ranks will receive the *SAME* batch
-                # 2. Different SP groups will receive *DIFFERENT* batches
-                # This is implemented by the DistributedSampler
-
-                batch_size, seqlen = input_ids.shape
-                # Remove padding
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
-
-                # Unpad position_ids to align rotary
-                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
-
-                # Pad and slice inputs for sequence parallelism
-                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size())
-                # For computing loss
-                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size())
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
-
-                # Forward pass
-                output = self.fsdp_model(
-                    input_ids=input_ids_rmpad_sliced,
-                    attention_mask=None,  # Not needed with flash attention varlen
-                    position_ids=position_ids_rmpad_padded,
-                    use_cache=False,
-                )
-
-                # Compute loss locally then aggregate
-                logits_rmpad = output.logits.squeeze(0)
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
-                loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
-                # Gather and unpad for sequence parallelism
-                loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-
-                # This is the loss collected from all ulysses ranks
-                full_loss = pad_input(hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
-                full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
-                full_loss = full_loss.reshape(-1)
-                loss_mask = loss_mask.to(full_loss.device)
-                loss = full_loss * loss_mask
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels.contiguous()
+            # Flatten the tokens
+            shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+            loss = loss * loss_mask.to(loss.device)
 
             valid_token_this_rank = torch.sum(loss_mask)
 
             if self.config.data.balance_dp_token:
                 torch.distributed.all_reduce(valid_token_this_rank)
-                dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
+                dp_size = torch.distributed.get_world_size()
             else:
                 dp_size = 1
 
@@ -492,6 +431,7 @@ class FSDPSFTTrainer:
                 project_name=self.config.trainer.project_name,
                 experiment_name=self.config.trainer.experiment_name,
                 default_backend=self.config.trainer.logger,
+                config=OmegaConf.to_container(self.config, resolve=True, throw_on_missing=False),
             )
 
         global_step = 0
@@ -499,7 +439,6 @@ class FSDPSFTTrainer:
         # compute the total training steps.
         # the total training steps in SFT is mainly for early exit
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
