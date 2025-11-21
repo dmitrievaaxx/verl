@@ -19,6 +19,7 @@ TODO(zhangchi.usc1992)
 """
 
 import os
+from omegaconf import OmegaConf
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -189,7 +190,7 @@ class FSDPSFTTrainer:
                 local_model_path,
                 config=config,
                 torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation="eager",
                 trust_remote_code=trust_remote_code,
             )
 
@@ -492,6 +493,7 @@ class FSDPSFTTrainer:
                 project_name=self.config.trainer.project_name,
                 experiment_name=self.config.trainer.experiment_name,
                 default_backend=self.config.trainer.logger,
+                config=OmegaConf.to_container(self.config, resolve=True)
             )
 
         global_step = 0
